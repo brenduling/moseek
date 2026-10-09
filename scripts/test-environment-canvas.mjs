@@ -29,7 +29,7 @@ test('writes scope updates to both the row and selected Environment', async () =
   const query = {
     eq(column, value) { calls.push(['eq', column, value]); return this },
     select(columns) { calls.push(['select', columns]); return this },
-    single() { return Promise.resolve({ data: { id: first, x: 42 }, error: null }) },
+    maybeSingle() { return Promise.resolve({ data: { id: first, x: 42 }, error: null }) },
   }
   const db = { from(table) { calls.push(['from', table]); return {
     update(patch) { calls.push(['update', patch]); return query },

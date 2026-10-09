@@ -1,5 +1,5 @@
 import { NodeResizeControl, NodeResizer } from '@xyflow/react'
-import { File, FileArchive, FileImage, FileSpreadsheet, FileText, Link2, MessageCircle, Presentation, StickyNote } from 'lucide-react'
+import { File, FileArchive, FileImage, FileSpreadsheet, FileText, Grip, Link2, MessageCircle, Presentation, StickyNote } from 'lucide-react'
 import ResourceActions from '../kandid/ResourceActions.jsx'
 import ColorPicker from '../layout/ColorPicker.jsx'
 import { linkIdentity, classifyFile } from '../../utils/resourceIdentity.js'
@@ -8,13 +8,31 @@ import { supabase } from '../../lib/supabase.js'
 import { useEffect, useState } from 'react'
 import SectionDiscussionBox from './SectionDiscussionBox.jsx'
 
+function MobileDragHandle({ label, onStart, onMove }) {
+  if (!onStart) return null
+  return <button type="button" className="mobile-mosaic-drag-handle nodrag nopan" title={`Drag to move ${label}`}
+    aria-label={`Move ${label}. Drag to reposition, or use the arrow keys.`}
+    onPointerDown={(event) => { event.stopPropagation(); onStart(event) }}
+    onKeyDown={(event) => {
+      const vectors = { ArrowUp: [0, -24], ArrowDown: [0, 24], ArrowLeft: [-24, 0], ArrowRight: [24, 0] }
+      const vector = vectors[event.key]
+      if (!vector || !onMove) return
+      event.preventDefault()
+      event.stopPropagation()
+      const scale = event.shiftKey ? 4 : 1
+      onMove(vector[0] * scale, vector[1] * scale)
+    }}>
+    <Grip size={17} strokeWidth={1.8} aria-hidden="true" />
+  </button>
+}
+
 export function SectionNode({ id, data, selected }) {
   const section = data.row
   return <div className={`kandid-section${selected ? ' is-selected' : ''}${data.isDropTarget ? ' is-drop-target' : ''}`} data-color={data.color}>
     <NodeResizer isVisible={selected && data.canEdit} minWidth={360} minHeight={240}
       maxWidth={1400} maxHeight={1000} handleClassName="moseek-resizer-handle"
       lineClassName="moseek-resizer-line" onResizeEnd={(_event, params) => data.onResize(id, params)} />
-    <div className="section-heading"><h2 title={section.title}>{section.title}</h2>
+    <div className="section-heading"><MobileDragHandle label={section.title} onStart={data.canEdit ? data.onMobileDragStart : undefined} onMove={data.canEdit ? data.onMobileMove : undefined} /><h2 title={section.title}>{section.title}</h2>
       <div className="section-heading-actions">
         {data.discussion && <button type="button" className="section-discussion-trigger nodrag nopan"
           aria-expanded={data.discussionOpen} onPointerDown={(event) => event.stopPropagation()}
@@ -45,7 +63,7 @@ export function SectionNode({ id, data, selected }) {
 export function NoteNode({ data, selected }) {
   const note = data.row
   return <article className={`kandid-resource kandid-resource-note editable-note${selected ? ' is-selected' : ''}`} data-color={data.color}>
-    <div className="kandid-resource-type"><StickyNote size={17} strokeWidth={1.75} aria-hidden="true" /><span>Note</span>
+    <div className="kandid-resource-type"><MobileDragHandle label={note.title} onStart={data.canEdit ? data.onMobileDragStart : undefined} onMove={data.canEdit ? data.onMobileMove : undefined} /><StickyNote size={17} strokeWidth={1.75} aria-hidden="true" /><span>Note</span>
       {selected && data.canEdit && <ColorPicker value={data.color} itemName={note.title}
         onChange={(color) => data.onColor('note', note.id, color)} />}</div>
     <h3 title={note.title}>{note.title}</h3>
@@ -68,7 +86,7 @@ export function LinkNode({ data, selected }) {
   const link = data.row
   const identity = linkIdentity(link.url)
   return <article className={`kandid-resource kandid-resource-external${selected ? ' is-selected' : ''}`}>
-    <div className="kandid-resource-type"><LinkMark key={identity.faviconUrl || link.url}
+    <div className="kandid-resource-type"><MobileDragHandle label={link.title} onStart={data.canEdit ? data.onMobileDragStart : undefined} onMove={data.canEdit ? data.onMobileMove : undefined} /><LinkMark key={identity.faviconUrl || link.url}
       faviconUrl={identity.faviconUrl} /><span>Link</span></div>
     <h3 title={link.title}>{link.title}</h3>
     <p title={link.url}>{link.url}</p>
@@ -88,7 +106,7 @@ export function FileNode({ data, selected }) {
   const type = classifyFile(file)
   const Icon = fileIcons[type.kind]
   return <article className="kandid-resource kandid-file environment-file" aria-label={`${type.label}: ${file.title}`}>
-    <div className="kandid-resource-type"><Icon size={18} strokeWidth={1.7} aria-hidden="true" /><span>{type.label}</span></div>
+    <div className="kandid-resource-type"><MobileDragHandle label={file.title} onStart={data.canEdit ? data.onMobileDragStart : undefined} onMove={data.canEdit ? data.onMobileMove : undefined} /><Icon size={18} strokeWidth={1.7} aria-hidden="true" /><span>{type.label}</span></div>
     <h3 title={file.original_filename || file.title}>{file.title}</h3>
     <p title={file.original_filename || ''}>{file.original_filename || 'File'}</p>
     {file.file_size != null && <p>{formatFileSize(Number(file.file_size))}</p>}
@@ -123,7 +141,7 @@ export function ImageNode({ id, data, selected }) {
       : <div className="environment-image-fallback" role={preview === 'unavailable' ? 'status' : undefined}>
         {preview === 'loading' ? 'Loading image…' : 'Preview unavailable'}
       </div>}
-    <div className="environment-image-caption"><strong title={image.title}>{image.title}</strong>
+    <div className="environment-image-caption"><MobileDragHandle label={image.title} onStart={data.canEdit ? data.onMobileDragStart : undefined} onMove={data.canEdit ? data.onMobileMove : undefined} /><strong title={image.title}>{image.title}</strong>
       <span>{formatFileSize(Number(image.file_size))}</span></div>
     {selected && <ResourceActions resource={{ id: image.id, name: image.title }}
       onOpen={() => data.onOpen(image)} openLabel="Open image"

@@ -9,6 +9,7 @@ import GlobalActivityPanel from '../layout/GlobalActivityPanel.jsx'
 import GlobalCalendarPanel from '../layout/GlobalCalendarPanel.jsx'
 import WorkspaceBar from '../layout/WorkspaceBar.jsx'
 import InvitationInboxPanel from '../layout/InvitationInboxPanel.jsx'
+import MobileHomeView from './MobileHomeView.jsx'
 import { profilePresentation } from '../../utils/profile.js'
 import { readColor, saveColor } from '../../utils/personalization.js'
 import { preferenceColor, SERVER_COLORS_ENABLED } from '../../lib/serverColors.js'
@@ -127,6 +128,7 @@ function SpatialHome({ user, profile, environments, loading, loadedOnce, error, 
       await onCreate({ name: trimmedName, type })
       setCreating(false)
       setName('')
+      requestAnimationFrame(() => document.querySelector('.mobile-home-create, .workspace-bar .create-environment')?.focus())
     } catch (createFailure) {
       setCreateError(createFailure.message || 'Could not create this Environment.')
     } finally {
@@ -134,9 +136,27 @@ function SpatialHome({ user, profile, environments, loading, loadedOnce, error, 
     }
   }
 
+  function closeCreateDialog() {
+    if (saving) return
+    setCreating(false)
+    requestAnimationFrame(() => document.querySelector('.mobile-home-create, .workspace-bar .create-environment')?.focus())
+  }
+
+  function handleCreateDialogKeyDown(event) {
+    if (event.key === 'Escape') { event.preventDefault(); closeCreateDialog(); return }
+    if (event.key !== 'Tab') return
+    const controls = [...event.currentTarget.querySelectorAll('button:not(:disabled), input:not(:disabled), select:not(:disabled)')]
+      .filter((control) => control.getClientRects().length)
+    if (!controls.length) return
+    const last = controls[controls.length - 1]
+    if (event.shiftKey && document.activeElement === controls[0]) { event.preventDefault(); last.focus() }
+    else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); controls[0].focus() }
+  }
+
   return (
     <main className="spatial-home" aria-label="Moseek Home workspace">
       <ReactFlow
+        className="desktop-home-canvas"
         nodes={nodes}
         edges={[]}
         nodeTypes={nodeTypes}
@@ -160,6 +180,18 @@ function SpatialHome({ user, profile, environments, loading, loadedOnce, error, 
         fitViewOptions={{ padding: 0.13, minZoom: 0.55, maxZoom: 1 }}
         proOptions={{ hideAttribution: true }}
       />
+      <MobileHomeView user={user} profileName={presented.displayName} loading={loading} loadedOnce={loadedOnce}
+        error={error} onRetry={onRetry} onCreate={() => setCreating(true)} onOpenEnvironment={onOpenEnvironment}
+        environments={environments.map((environment) => ({ ...environment,
+          resourceCount: resourceCounts?.[environment.id], resourceCountStatus }))}
+        colorFor={(id) => SERVER_COLORS_ENABLED
+          ? colorReady ? preferenceColor(colorPreferences, id) : 'neutral'
+          : readColor(user.id, 'environment', id)}
+        onSaveColor={!SERVER_COLORS_ENABLED || colorReady ? (id, color) => changeColor(id, color) : undefined}
+        onOpenActivity={() => { setGlobalCalendarOpen(false); setGlobalActivityOpen((open) => !open) }}
+        onOpenCalendar={() => { setGlobalActivityOpen(false); setGlobalCalendarOpen((open) => !open) }}
+        onOpenInvitations={() => setInvitationInboxOpen((open) => !open)}
+        onOpenSettings={onOpenSettings} onOpenTutorial={onOpenTutorial} onSignOut={onSignOut} />
       <WorkspaceBar onReset={handleReset} onCreate={() => setCreating(true)} onOpenTutorial={onOpenTutorial}
         onOpenSettings={onOpenSettings} tutorialStatus={tutorialStatus} onSignOut={onSignOut}
         onOpenGlobalActivity={() => { setGlobalCalendarOpen(false); setGlobalActivityOpen((open) => !open) }}
@@ -188,14 +220,15 @@ function SpatialHome({ user, profile, environments, loading, loadedOnce, error, 
         error={error || activityError}
         onRetry={onRetry}
       />
-      {creating && <div className="dialog-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget && !saving) setCreating(false) }}>
-        <form className="create-dialog" onSubmit={handleCreate} aria-label="Create Environment">
+      {creating && <div className="dialog-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) closeCreateDialog() }}>
+        <form className="create-dialog" role="dialog" aria-modal="true" aria-labelledby="create-environment-title"
+          onKeyDown={handleCreateDialogKeyDown} onSubmit={handleCreate}>
           <span className="portal-kicker">New space</span>
-          <h2>Create Environment</h2>
+          <h2 id="create-environment-title">Create Environment</h2>
           <label>Name<input autoFocus maxLength={160} value={name} onChange={(event) => setName(event.target.value)} required /></label>
           <label>Type<select value={type} onChange={(event) => setType(event.target.value)}><option value="shared">Shared</option><option value="personal">Personal</option></select></label>
           {createError && <p className="form-error" role="alert">{createError}</p>}
-          <div className="dialog-actions"><button type="button" onClick={() => setCreating(false)} disabled={saving}>Cancel</button><button type="submit" disabled={saving}>{saving ? 'Creating…' : 'Create'}</button></div>
+          <div className="dialog-actions"><button type="button" onClick={closeCreateDialog} disabled={saving}>Cancel</button><button type="submit" disabled={saving}>{saving ? 'Creating…' : 'Create'}</button></div>
         </form>
       </div>}
     </main>

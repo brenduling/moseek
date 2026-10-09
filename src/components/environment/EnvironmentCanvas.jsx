@@ -1,11 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { FileImage, FileText, LayoutPanelTop, Link2, Plus, Upload } from 'lucide-react'
-import { ReactFlow, useNodesState } from '@xyflow/react'
+import { Controls, ReactFlow, useNodesState } from '@xyflow/react'
 import WorkspaceBar from '../layout/WorkspaceBar.jsx'
 import { FileNode, ImageNode, LinkNode, NoteNode, SectionNode, UnsupportedResourceNode } from './CanvasNodes.jsx'
 import { supabase } from '../../lib/supabase.js'
 import { deleteCanvasRow, insertCanvasRow, updateCanvasRow } from '../../lib/environmentWrites.js'
 import { nodePosition, validCanvasPosition, validateLinkUrl } from '../../utils/environmentCanvas.js'
+import { canvasNodeDragPatch, canvasPositionDelta, readCanvasViewport, restoreCanvasPositions, saveCanvasViewport, shouldStartNodeDrag } from '../../utils/canvasViewport.js'
 import { profilePresentation } from '../../utils/profile.js'
 import { readColor, saveColor } from '../../utils/personalization.js'
 import { checkedColor, ColorConflictError, SERVER_COLORS_ENABLED, setSharedColor } from '../../lib/serverColors.js'
@@ -19,6 +20,8 @@ import EnvironmentCalendarPanel from './EnvironmentCalendarPanel.jsx'
 import GlobalActivityPanel from '../layout/GlobalActivityPanel.jsx'
 import GlobalCalendarPanel from '../layout/GlobalCalendarPanel.jsx'
 import { environmentStoragePath, imageCardDimensions, safeOriginalFilename, validateEnvironmentUpload } from '../../lib/environmentFiles.js'
+import MobileEnvironmentView from './MobileEnvironmentView.jsx'
+import MobileMosaicNavigation from './MobileMosaicNavigation.jsx'
 
 const nodeTypes = {
   section: SectionNode,
@@ -72,13 +75,18 @@ function EnvironmentCanvas({ environment, role, sections, resources, user, profi
   const [globalCalendarOpen, setGlobalCalendarOpen] = useState(false)
   const [sectionDiscussions, setSectionDiscussions] = useState({})
   const [openDiscussionId, setOpenDiscussionId] = useState(null)
+  const [mobileSectionId, setMobileSectionId] = useState(null)
+  const [mobileListOpen, setMobileListOpen] = useState(false)
   const [environmentDetails, setEnvironmentDetails] = useState(environment)
+  const [mobileLayout, setMobileLayout] = useState(() => window.matchMedia('(max-width: 820px)').matches)
   const busyRef = useRef(false)
   const retryRef = useRef(null)
   const dirtyRef = useRef(false)
   const nodesRef = useRef([])
   const flowRef = useRef(null)
   const canvasRef = useRef(null)
+  const mobileDragRef = useRef(null)
+  const mobileLayoutRef = useRef(mobileLayout)
   const createdCountRef = useRef(0)
   const [nodes, setNodes, onNodesChange] = useNodesState(() => initialNodes(sections, resources, editable,
     { onEdit: openEditor, onDelete: deleteNode, onOpen: openResource, onResize: resizeCanvasNode, onColor: changeColor }, user.id))
@@ -135,10 +143,11 @@ function EnvironmentCanvas({ environment, role, sections, resources, user, profi
     })
   }, [])
 
-  const displayNodes = nodes.map((node) => node.type !== 'section' ? node : {
-    ...node,
-    data: {
+  const displayNodes = nodes.map((node) => ({ ...node, data: {
       ...node.data,
+      onMobileDragStart: (event) => startMobileNodeDrag(node.id, event),
+      onMobileMove: (dx, dy) => moveNodeByKeyboard(node.id, dx, dy),
+      ...(node.type !== 'section' ? {} : {
       discussion: sectionDiscussions[node.id] || null,
       discussionOpen: Boolean(sectionDiscussions[node.id] && openDiscussionId === sectionDiscussions[node.id].id),
       isDiscussionOwner: environmentDetails.type === 'shared' && role === 'owner',
@@ -149,8 +158,25 @@ function EnvironmentCanvas({ environment, role, sections, resources, user, profi
       onCloseDiscussion: () => setOpenDiscussionId(null),
       onRemoveDiscussion: removeDiscussion,
       onDiscussionRead: markDiscussionRead,
-    },
-  })
+      }),
+    } }))
+
+  useEffect(() => {
+    const media = window.matchMedia('(max-width: 820px)')
+    const update = () => setMobileLayout(media.matches)
+    update()
+    media.addEventListener('change', update)
+    return () => media.removeEventListener('change', update)
+  }, [])
+
+  useEffect(() => {
+    mobileLayoutRef.current = mobileLayout
+    if (!flowRef.current) return
+    const saved = readCanvasViewport(user.id, environment.id, mobileLayout ? 'mobile' : 'desktop')
+    if (saved) flowRef.current.setViewport(saved, { duration: 0 })
+    else flowRef.current.fitView({ padding: mobileLayout ? 0.24 : 0.15,
+      minZoom: mobileLayout ? 0.34 : 0.6, maxZoom: mobileLayout ? 0.82 : 1 })
+  }, [mobileLayout, environment.id, user.id])
 
   useEffect(() => { nodesRef.current = nodes }, [nodes])
   useEffect(() => {
@@ -170,7 +196,7 @@ function EnvironmentCanvas({ environment, role, sections, resources, user, profi
 
   function updateNodeRow(row) {
     commitNodes(nodesRef.current.map((node) => node.id === row.id
-      ? { ...node, style: ['section', 'image'].includes(node.type) && row.width != null
+      ? { ...node, position: nodePosition(row), style: ['section', 'image'].includes(node.type) && row.width != null
         ? { width: Number(row.width), height: Number(row.height) } : node.style,
       data: { ...node.data, row,
         color: SERVER_COLORS_ENABLED && ['note', 'section'].includes(node.type)
@@ -266,9 +292,21 @@ function EnvironmentCanvas({ environment, role, sections, resources, user, profi
   }
 
   function positionNearCenter(width, height) {
-    const bounds = canvasRef.current.getBoundingClientRect()
-    const center = flowRef.current.screenToFlowPosition({ x: bounds.left + bounds.width / 2, y: bounds.top + bounds.height / 2 })
     const offset = (createdCountRef.current++ % 4) * 22
+    if (!flowRef.current || !canvasRef.current) {
+      const existing = nodesRef.current
+      const x = existing.length ? Math.max(...existing.map((node) => Number(node.data.row?.x ?? node.position.x) || 0)) + 36 : 80
+      const y = existing.length ? Math.max(...existing.map((node) => Number(node.data.row?.y ?? node.position.y) || 0)) + 36 : 100
+      return { x: x + offset, y: y + offset }
+    }
+    const bounds = canvasRef.current.getBoundingClientRect()
+    if (!bounds.width || !bounds.height) {
+      const existing = nodesRef.current
+      const x = existing.length ? Math.max(...existing.map((node) => Number(node.data.row?.x ?? node.position.x) || 0)) + 36 : 80
+      const y = existing.length ? Math.max(...existing.map((node) => Number(node.data.row?.y ?? node.position.y) || 0)) + 36 : 100
+      return { x: x + offset, y: y + offset }
+    }
+    const center = flowRef.current.screenToFlowPosition({ x: bounds.left + bounds.width / 2, y: bounds.top + bounds.height / 2 })
     return { x: Math.round(center.x - width / 2 + offset), y: Math.round(center.y - height / 2 + offset) }
   }
 
@@ -309,7 +347,7 @@ function EnvironmentCanvas({ environment, role, sections, resources, user, profi
     const cardHeight = kind === 'image' ? dimensions.height : 150
     const position = positionNearCenter(cardWidth, cardHeight)
     const values = {
-      id, environment_id: environment.id, section_id: null, created_by: user.id,
+      id, environment_id: environment.id, section_id: mobileSectionId || null, created_by: user.id,
       type: kind, title, original_filename: originalFilename, mime_type: type.mime,
       file_size: file.size, storage_path: path, x: position.x, y: position.y,
       ...(kind === 'image' ? dimensions : {}),
@@ -386,8 +424,8 @@ function EnvironmentCanvas({ environment, role, sections, resources, user, profi
         const values = draft.kind === 'section'
           ? { ...base, width: draft.width, height: draft.height }
           : draft.kind === 'note'
-            ? { ...base, type: 'note', body: draft.body }
-            : { ...base, type: 'link', url: draft.url }
+            ? { ...base, section_id: mobileSectionId || null, type: 'note', body: draft.body }
+            : { ...base, section_id: mobileSectionId || null, type: 'link', url: draft.url }
         row = await insertCanvasRow(supabase, table, values)
         if (!nodesRef.current.some((node) => node.id === row.id)) commitNodes([...nodesRef.current,
           makeNode(row, draft.kind, editable, { onEdit: openEditor, onDelete: deleteNode, onOpen: openResource,
@@ -439,7 +477,8 @@ function EnvironmentCanvas({ environment, role, sections, resources, user, profi
       setOpenError('This private file could not be opened. Check your Environment access and try again.')
       return
     }
-    window.open(data.signedUrl, '_blank', 'noopener,noreferrer')
+    if (window.matchMedia('(max-width: 820px)').matches) window.location.assign(data.signedUrl)
+    else window.open(data.signedUrl, '_blank', 'noopener,noreferrer')
     setOpenError('')
   }
 
@@ -497,6 +536,102 @@ function EnvironmentCanvas({ environment, role, sections, resources, user, profi
       return centerX >= section.position.x + 24 && centerX <= section.position.x + sectionWidth - 24
         && centerY >= section.position.y + 52 && centerY <= section.position.y + sectionHeight - 24
     })?.id || null
+  }
+
+  function applyMobileDrag(active, flowPoint) {
+    const delta = canvasPositionDelta(active.startFlow, flowPoint)
+    const dragged = active.snapshot.find((item) => item.id === active.id)
+    if (!dragged) return
+    const position = { x: dragged.position.x + delta.x, y: dragged.position.y + delta.y }
+    const provisional = { ...nodesRef.current.find((item) => item.id === active.id), position }
+    const targetSectionId = provisional.type === 'section' ? null : sectionDropTarget(provisional)
+    active.targetSectionId = targetSectionId
+    commitNodes(nodesRef.current.map((node) => {
+      const original = active.snapshot.find((item) => item.id === node.id)
+      if (!original) return node
+      if (node.id === active.id) return { ...node, position, data: { ...node.data, isDropTarget: false } }
+      if (dragged.type === 'section' && node.type !== 'section' && node.data.row.section_id === dragged.id) {
+        return { ...node, position: { x: original.position.x + delta.x, y: original.position.y + delta.y } }
+      }
+      if (node.type === 'section') return { ...node, position: original.position,
+        data: { ...node.data, isDropTarget: node.id === targetSectionId } }
+      return { ...node, position: original.position }
+    }))
+  }
+
+  function startMobileNodeDrag(id, event) {
+    if (!mobileLayoutRef.current || !editable || locked || busyRef.current || retryRef.current
+      || event.button !== 0 || !event.isPrimary || mobileDragRef.current) return
+    const node = nodesRef.current.find((item) => item.id === id)
+    if (!node || !['section', 'note', 'link', 'file', 'image'].includes(node.type)) return
+    event.preventDefault()
+    event.stopPropagation()
+    event.currentTarget.setPointerCapture?.(event.pointerId)
+    mobileDragRef.current = {
+      id, pointerId: event.pointerId, startClient: { x: event.clientX, y: event.clientY },
+      startFlow: flowRef.current.screenToFlowPosition({ x: event.clientX, y: event.clientY }),
+      snapshot: nodesRef.current.map((item) => ({ id: item.id, position: { ...item.position } })),
+      originalNode: node, moved: false, targetSectionId: node.data.row.section_id || null,
+    }
+  }
+
+  function handleMobilePointerDownCapture(event) {
+    const active = mobileDragRef.current
+    if (active && active.pointerId !== event.pointerId) cancelMobileNodeDrag()
+  }
+
+  function handleMobilePointerMove(event) {
+    const active = mobileDragRef.current
+    if (!active || active.pointerId !== event.pointerId || !flowRef.current) return
+    const distance = Math.hypot(event.clientX - active.startClient.x, event.clientY - active.startClient.y)
+    if (!active.moved && !shouldStartNodeDrag(distance)) return
+    active.moved = true
+    event.preventDefault()
+    applyMobileDrag(active, flowRef.current.screenToFlowPosition({ x: event.clientX, y: event.clientY }))
+  }
+
+  function handleMobilePointerUp(event) {
+    const active = mobileDragRef.current
+    if (!active || active.pointerId !== event.pointerId) return
+    mobileDragRef.current = null
+    if (!active.moved) return
+    const moved = nodesRef.current.find((node) => node.id === active.id)
+    if (!moved) return
+    if (moved.type === 'section') {
+      const row = active.originalNode.data.row
+      persistSectionGroup(active.originalNode, { x: moved.position.x, y: moved.position.y,
+        width: Number(moved.measured?.width || moved.width || moved.style?.width || row.width),
+        height: Number(moved.measured?.height || moved.height || moved.style?.height || row.height) })
+    } else {
+      const patch = canvasNodeDragPatch(moved, active.targetSectionId)
+      persistPosition(active.originalNode, patch)
+    }
+  }
+
+  function cancelMobileNodeDrag() {
+    const active = mobileDragRef.current
+    if (!active) return
+    mobileDragRef.current = null
+    commitNodes(restoreCanvasPositions(nodesRef.current, active.snapshot))
+  }
+
+  function handleLostMobilePointerCapture(event) {
+    if (mobileDragRef.current?.pointerId === event.pointerId) cancelMobileNodeDrag()
+  }
+
+  function moveNodeByKeyboard(id, dx, dy) {
+    if (!mobileLayoutRef.current || !editable || locked || busyRef.current || retryRef.current) return
+    const node = nodesRef.current.find((item) => item.id === id)
+    if (!node) return
+    const target = { x: node.position.x + dx, y: node.position.y + dy }
+    if (node.type === 'section') {
+      persistSectionGroup(node, { ...target,
+        width: Number(node.measured?.width || node.width || node.style?.width || node.data.row.width),
+        height: Number(node.measured?.height || node.height || node.style?.height || node.data.row.height) })
+      return
+    }
+    const provisional = { ...node, position: target }
+    persistPosition(node, canvasNodeDragPatch(provisional, sectionDropTarget(provisional)))
   }
 
   function handleNodeDrag(_event, draggedNode) {
@@ -598,20 +733,84 @@ function EnvironmentCanvas({ environment, role, sections, resources, user, profi
 
   const locked = saving || uploading || needsRetry
   const presented = profilePresentation(user, profile)
+  const canManageInvitations = canManageEnvironmentContributors(role)
+
+  async function moveResource(row, sectionId) {
+    if (!editable || busyRef.current || retryRef.current || (row.section_id || null) === sectionId) return
+    await runWrite(async () => {
+      const updated = await updateCanvasRow(supabase, 'resources', environment.id, row.id,
+        { section_id: sectionId }, row.updated_at)
+      updateNodeRow(updated)
+    })
+  }
+
+  function triggerMobileUpload(kind) {
+    const input = kind === 'image' ? imageInputRef.current : fileInputRef.current
+    input?.click()
+  }
 
   function closeEnvironmentSettings() {
     setEnvironmentSettingsOpen(false)
-    requestAnimationFrame(() => document.getElementById('environment-settings-trigger')?.focus())
+    requestAnimationFrame(() => document.getElementById(window.matchMedia('(max-width: 820px)').matches
+      ? 'mobile-environment-more-trigger' : 'environment-settings-trigger')?.focus())
   }
 
-  return <main className={`spatial-home environment-canvas${locked ? ' is-locked' : ''}`} ref={canvasRef} aria-label={`${environmentDetails.name} workspace`}>
-    <ReactFlow nodes={displayNodes} edges={[]} nodeTypes={nodeTypes} onNodesChange={onNodesChange}
+  return <main className={`spatial-home environment-canvas${locked ? ' is-locked' : ''}${mobileLayout && mobileListOpen ? ' is-mobile-list' : ''}`}
+    ref={canvasRef} aria-label={`${environmentDetails.name} workspace`} onPointerDownCapture={handleMobilePointerDownCapture}
+    onPointerMove={handleMobilePointerMove} onPointerUp={handleMobilePointerUp} onPointerCancel={cancelMobileNodeDrag}
+    onLostPointerCapture={handleLostMobilePointerCapture}>
+    <ReactFlow className="environment-desktop-canvas" nodes={mobileLayout && mobileListOpen ? [] : displayNodes} edges={[]} nodeTypes={nodeTypes} onNodesChange={onNodesChange}
       onNodeDrag={handleNodeDrag} onNodeDragStop={handleNodeDragStop}
-      onInit={(instance) => { flowRef.current = instance }} nodesConnectable={false}
-      nodesDraggable={editable && !locked} elevateNodesOnSelect={false}
+      onInit={(instance) => { flowRef.current = instance
+        const saved = readCanvasViewport(user.id, environment.id, mobileLayoutRef.current ? 'mobile' : 'desktop')
+        if (saved) instance.setViewport(saved, { duration: 0 })
+        else instance.fitView({ padding: mobileLayoutRef.current ? 0.24 : 0.15,
+          minZoom: mobileLayoutRef.current ? 0.34 : 0.6, maxZoom: mobileLayoutRef.current ? 0.82 : 1 })
+      }} onMoveEnd={(_event, viewport) => saveCanvasViewport(user.id, environment.id,
+        mobileLayoutRef.current ? 'mobile' : 'desktop', viewport)} nodesConnectable={false}
+      nodesDraggable={editable && !locked && !mobileLayout} elevateNodesOnSelect={false}
       panOnDrag zoomOnScroll zoomOnPinch zoomOnDoubleClick={false}
-      minZoom={0.4} maxZoom={1.5} fitView fitViewOptions={{ padding: 0.15, minZoom: 0.6, maxZoom: 1 }}
-      proOptions={{ hideAttribution: true }} />
+      minZoom={mobileLayout ? 0.2 : 0.4} maxZoom={mobileLayout ? 2 : 1.5}
+      proOptions={{ hideAttribution: true }}>
+      <Controls position="bottom-left" showZoom showFitView showInteractive={false}
+        fitViewOptions={{ padding: mobileLayout ? 0.24 : 0.15, minZoom: mobileLayout ? 0.34 : 0.6, maxZoom: mobileLayout ? 0.82 : 1 }} />
+    </ReactFlow>
+    {mobileLayout && !mobileListOpen && <MobileMosaicNavigation environment={environmentDetails} canEdit={editable}
+      canManageInvitations={canManageInvitations}
+      hasMembers={environmentDetails.type === 'shared'} onBack={() => leave(onLeave)} onList={() => {
+        setMobileListOpen(true)
+        requestAnimationFrame(() => document.getElementById('mobile-environment-view-mosaic-toggle')?.focus())
+      }}
+      onAdd={() => setMenuOpen((open) => !open)}
+      onSettings={() => { setContributorsOpen(false); setInvitationsOpen(false); setInvitationInboxOpen(false); setCalendarOpen(false); setActivityOpen(false); setEnvironmentSettingsOpen((open) => !open) }}
+      onContributors={() => { setEnvironmentSettingsOpen(false); setInvitationsOpen(false); setInvitationInboxOpen(false); setCalendarOpen(false); setActivityOpen(false); setContributorsOpen((open) => !open) }}
+      onInvitations={() => { setContributorsOpen(false); setEnvironmentSettingsOpen(false); setInvitationInboxOpen(false); setCalendarOpen(false); setActivityOpen(false); setInvitationsOpen((open) => !open) }}
+      onInbox={() => { setContributorsOpen(false); setInvitationsOpen(false); setEnvironmentSettingsOpen(false); setCalendarOpen(false); setActivityOpen(false); setInvitationInboxOpen((open) => !open) }}
+      onActivity={() => { setContributorsOpen(false); setInvitationsOpen(false); setEnvironmentSettingsOpen(false); setInvitationInboxOpen(false); setCalendarOpen(false); setGlobalActivityOpen(false); setGlobalCalendarOpen(false); setActivityOpen((open) => !open) }}
+      onCalendar={() => { setContributorsOpen(false); setInvitationsOpen(false); setEnvironmentSettingsOpen(false); setInvitationInboxOpen(false); setActivityOpen(false); setGlobalActivityOpen(false); setGlobalCalendarOpen(false); setCalendarOpen((open) => !open) }}
+      onGlobalActivity={() => { setContributorsOpen(false); setInvitationsOpen(false); setEnvironmentSettingsOpen(false); setInvitationInboxOpen(false); setCalendarOpen(false); setActivityOpen(false); setGlobalCalendarOpen(false); setGlobalActivityOpen((open) => !open) }}
+      onGlobalCalendar={() => { setContributorsOpen(false); setInvitationsOpen(false); setEnvironmentSettingsOpen(false); setInvitationInboxOpen(false); setCalendarOpen(false); setActivityOpen(false); setGlobalActivityOpen(false); setGlobalCalendarOpen((open) => !open) }}
+      onProfileSettings={onOpenSettings} onSignOut={() => leave(onSignOut)} />}
+    {mobileLayout && mobileListOpen && <MobileEnvironmentView environment={environmentDetails} canEdit={editable}
+      canManageInvitations={canManageInvitations} nodes={displayNodes}
+      locked={locked} onBack={() => leave(onLeave)} onCreate={(kind) => startCreate(kind || 'note')}
+      onReturnToMosaic={() => {
+        setMobileListOpen(false); setMobileSectionId(null)
+        requestAnimationFrame(() => document.getElementById('mobile-mosaic-list-trigger')?.focus())
+      }}
+      onUpload={triggerMobileUpload} onMove={moveResource}
+      onFocusSection={setMobileSectionId}
+      discussionNode={displayNodes.find((node) => node.type === 'section' && node.id === mobileSectionId)}
+      onOpenSettings={() => { setContributorsOpen(false); setInvitationsOpen(false); setInvitationInboxOpen(false); setCalendarOpen(false); setActivityOpen(false); setEnvironmentSettingsOpen((open) => !open) }}
+      onOpenProfileSettings={onOpenSettings}
+      onOpenContributors={() => { setEnvironmentSettingsOpen(false); setInvitationsOpen(false); setInvitationInboxOpen(false); setCalendarOpen(false); setActivityOpen(false); setContributorsOpen((open) => !open) }}
+      onOpenInvitations={() => { setContributorsOpen(false); setEnvironmentSettingsOpen(false); setInvitationInboxOpen(false); setCalendarOpen(false); setActivityOpen(false); setInvitationsOpen((open) => !open) }}
+      onOpenInbox={() => { setContributorsOpen(false); setInvitationsOpen(false); setEnvironmentSettingsOpen(false); setCalendarOpen(false); setActivityOpen(false); setInvitationInboxOpen((open) => !open) }}
+      onOpenActivity={() => { setContributorsOpen(false); setInvitationsOpen(false); setEnvironmentSettingsOpen(false); setInvitationInboxOpen(false); setCalendarOpen(false); setGlobalActivityOpen(false); setGlobalCalendarOpen(false); setActivityOpen((open) => !open) }}
+      onOpenCalendar={() => { setContributorsOpen(false); setInvitationsOpen(false); setEnvironmentSettingsOpen(false); setInvitationInboxOpen(false); setActivityOpen(false); setGlobalActivityOpen(false); setGlobalCalendarOpen(false); setCalendarOpen((open) => !open) }}
+      onOpenGlobalActivity={() => { setContributorsOpen(false); setInvitationsOpen(false); setEnvironmentSettingsOpen(false); setInvitationInboxOpen(false); setCalendarOpen(false); setActivityOpen(false); setGlobalCalendarOpen(false); setGlobalActivityOpen((open) => !open) }}
+      onOpenGlobalCalendar={() => { setContributorsOpen(false); setInvitationsOpen(false); setEnvironmentSettingsOpen(false); setInvitationInboxOpen(false); setCalendarOpen(false); setActivityOpen(false); setGlobalActivityOpen(false); setGlobalCalendarOpen((open) => !open) }}
+      onSignOut={() => leave(onSignOut)} />}
     <WorkspaceBar environmentName={environmentDetails.name} environmentType={environmentDetails.type}
       onBack={() => leave(onLeave)}
       onSignOut={() => leave(onSignOut)} onOpenSettings={() => leave(onOpenSettings)}
